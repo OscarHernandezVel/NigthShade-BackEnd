@@ -15,9 +15,9 @@ services:
       - key: TOKEN_SECRET
         generateValue: true
       - key: PUBLIC_URL
-        sync: false
+        sync: https://github.com/OscarHernandezVel/NigthShade-BackEnd/edit/main/render.yaml
       - key: CORS_ORIGIN
-        sync: false
+        sync: https://github.com/OscarHernandezVel/NigthShade-FrontEnd
       - key: SMTP_HOST
         sync: false
       - key: SMTP_PORT
