@@ -11,9 +11,9 @@ services:
       - key: TOKEN_SECRET
         generateValue: true
       - key: PUBLIC_URL
-        value: https://nightshade-api.onrender.com
+        sync: false
       - key: CORS_ORIGIN
-        sync: https://github.com/OscarHernandezVel/NigthShade-FrontEnd
+        sync: false
       - key: SMTP_HOST
         sync: false
       - key: SMTP_PORT
