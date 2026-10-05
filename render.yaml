@@ -11,9 +11,9 @@ services:
       - key: TOKEN_SECRET
         generateValue: true
       - key: PUBLIC_URL
-        sync: false
+        value: https://nigthshade-backend.onrender.com
       - key: CORS_ORIGIN
-        sync: false
+        value: https://https-nigthshade-frontend-onrender-com.onrender.com
       - key: SMTP_HOST
         sync: false
       - key: SMTP_PORT
