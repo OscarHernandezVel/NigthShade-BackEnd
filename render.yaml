@@ -5,17 +5,13 @@ services:
     runtime: docker
     dockerfilePath: ./backend/Dockerfile
     dockerContext: .
-    plan: starter
+    plan: free
     healthCheckPath: /api/health
-    disk:
-      name: nightshade-data
-      mountPath: /data
-      sizeGB: 5
     envVars:
       - key: TOKEN_SECRET
         generateValue: true
       - key: PUBLIC_URL
-        sync: https://github.com/OscarHernandezVel/NigthShade-BackEnd/edit/main/render.yaml
+        value: https://nightshade-api.onrender.com
       - key: CORS_ORIGIN
         sync: https://github.com/OscarHernandezVel/NigthShade-FrontEnd
       - key: SMTP_HOST
