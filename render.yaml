@@ -13,7 +13,7 @@ services:
       - key: PUBLIC_URL
         value: https://nigthshade-backend.onrender.com
       - key: CORS_ORIGIN
-        value: https://https-nigthshade-frontend-onrender-com.onrender.com
+        value: https://nigthshade-frontend.onrender.com
       - key: SMTP_HOST
         sync: false
       - key: SMTP_PORT
