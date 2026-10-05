@@ -1,0 +1,44 @@
+# Render Blueprint: New → Blueprint → select this repository.
+services:
+  - type: web
+    name: nightshade-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: .
+    plan: starter
+    healthCheckPath: /api/health
+    disk:
+      name: nightshade-data
+      mountPath: /data
+      sizeGB: 5
+    envVars:
+      - key: TOKEN_SECRET
+        generateValue: true
+      - key: PUBLIC_URL
+        sync: false
+      - key: CORS_ORIGIN
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: MAIL_FROM
+        sync: false
+
+  - type: web
+    name: nightshade-web
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm ci && npx vite build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_URL
+        sync: false
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
