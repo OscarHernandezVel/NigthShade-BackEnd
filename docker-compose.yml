@@ -1,0 +1,35 @@
+# docker compose up --build   →  web: http://localhost:8080   api: http://localhost:4000
+services:
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file:
+      - path: backend/.env
+        required: false
+    environment:
+      PORT: 4000
+      PUBLIC_URL: ${PUBLIC_API_URL:-http://localhost:4000}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8080}
+      TOKEN_SECRET: ${TOKEN_SECRET:-change-me-with-openssl-rand-hex-32-xxxxxxxx}
+      EXPOSE_DEV_CODES: ${EXPOSE_DEV_CODES:-false}
+    volumes:
+      - nightshade-data:/data
+    ports:
+      - "4000:4000"
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        VITE_API_URL: ${PUBLIC_API_URL:-http://localhost:4000}
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  nightshade-data:
