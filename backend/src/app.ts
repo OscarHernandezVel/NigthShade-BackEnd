@@ -1,142 +1,205 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
-import nodemailer from 'nodemailer';
-import type { KeyValueStore, MailMessage, Mailer } from '../../shared/auth-service';
-import type { BlobStore } from '../../shared/library-service';
+import cors from 'cors';
+import express, { type NextFunction, type Request, type Response } from 'express';
+import multer from 'multer';
+import { AuthError, AuthService, type AuthErrorCode, type KeyValueStore, type MailMessage, type Mailer } from '../../shared/auth-service';
+import { LibraryError, LibraryService } from '../../shared/library-service';
+import type { Session } from '../../shared/types';
+import { createRateLimiter, signToken, verifyToken, type DiskBlobStore } from './infra';
 
-/** JSON file database. Writes go to a temp file first, then rename, so a crash never leaves half a file. */
-export class FileKeyValueStore implements KeyValueStore {
-  private readonly data: Record<string, string>;
-
-  constructor(private readonly file: string) {
-    mkdirSync(dirname(file), { recursive: true });
-    this.data = existsSync(file) ? (JSON.parse(readFileSync(file, 'utf8')) as Record<string, string>) : {};
-  }
-
-  get(key: string): string | null {
-    return this.data[key] ?? null;
-  }
-
-  set(key: string, value: string): void {
-    this.data[key] = value;
-    this.flush();
-  }
-
-  remove(key: string): void {
-    delete this.data[key];
-    this.flush();
-  }
-
-  private flush(): void {
-    const temp = `${this.file}.tmp`;
-    writeFileSync(temp, JSON.stringify(this.data));
-    renameSync(temp, this.file);
-  }
+export interface AppConfig {
+  tokenSecret: string;
+  corsOrigins: string[];
+  publicUrl: string;
+  maxUploadMb: number;
+  /** Returns verification codes in API responses. Only for demos without SMTP. */
+  exposeDevCodes: boolean;
+  passwordIterations?: number;
 }
 
-const SAFE_KEY = /^[A-Za-z0-9-]+$/;
-
-export class DiskBlobStore implements BlobStore {
-  readonly root: string;
-
-  constructor(root: string) {
-    this.root = resolve(root);
-    mkdirSync(this.root, { recursive: true });
-  }
-
-  pathFor(key: string): string {
-    if (!SAFE_KEY.test(key)) throw new Error('Invalid blob key');
-    return join(this.root, key);
-  }
-
-  async put(key: string, blob: Blob): Promise<void> {
-    await mkdir(this.root, { recursive: true });
-    await writeFile(this.pathFor(key), Buffer.from(await blob.arrayBuffer()));
-  }
-
-  async get(key: string): Promise<Blob | undefined> {
-    const path = this.pathFor(key);
-    return existsSync(path) ? new Blob([readFileSync(path)]) : undefined;
-  }
-
-  async delete(key: string): Promise<void> {
-    await rm(this.pathFor(key), { force: true });
-  }
+export interface AppDeps {
+  kv: KeyValueStore;
+  blobs: DiskBlobStore;
+  mailer: Mailer;
 }
 
-export interface SmtpConfig {
-  host: string;
-  port: number;
-  user?: string;
-  pass?: string;
-  from: string;
-}
+const SESSION_TTL = 60 * 60 * 24 * 7;
+const STREAM_TTL = 60 * 60 * 6;
 
-export function createMailer(smtp: SmtpConfig | null): Mailer {
-  if (!smtp) {
-    return {
-      send: (message: MailMessage) => console.log(`[mail] to=${message.to} subject="${message.subject}" code=${message.code}`),
-    };
-  }
-  const transport = nodemailer.createTransport({
-    host: smtp.host,
-    port: smtp.port,
-    secure: smtp.port === 465,
-    auth: smtp.user ? { user: smtp.user, pass: smtp.pass } : undefined,
-  });
-  const esc = (text: string) => text.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
-  return {
-    send: async (message: MailMessage) => {
-      const subject = esc(message.subject);
-      const body = esc(message.body);
-      await transport.sendMail({
-        from: smtp.from,
-        to: message.to,
-        subject: message.subject,
-        text: message.body,
-        html: `<div style="font-family:sans-serif;background:#0b0710;color:#fff;padding:24px;border-radius:12px">
-          <h2 style="color:#ff8c00;margin:0 0 12px">${subject}</h2><p>${body}</p>
-          <p style="font-size:28px;letter-spacing:6px;font-weight:700;color:#ff8c00">${esc(message.code)}</p></div>`,
-      });
+const STATUS: Record<AuthErrorCode, number> = {
+  NAME_REQUIRED: 400,
+  INVALID_EMAIL: 400,
+  WEAK_PASSWORD: 400,
+  INVALID_CODE: 400,
+  CODE_EXPIRED: 400,
+  EMAIL_TAKEN: 409,
+  INVALID_CREDENTIALS: 401,
+  EMAIL_NOT_VERIFIED: 403,
+  TOO_MANY_ATTEMPTS: 429,
+};
+
+type AuthedRequest = Request & { session?: Session };
+
+const str = (value: unknown) => (typeof value === 'string' ? value : '');
+const int = (value: unknown) => {
+  const n = Number(value);
+  if (!Number.isInteger(n)) throw new LibraryError('Expected a whole number.');
+  return n;
+};
+
+export function createApp(config: AppConfig, deps: AppDeps) {
+  const lastMail = new Map<string, MailMessage>();
+  const mailer: Mailer = {
+    send: async (message) => {
+      lastMail.set(message.to, message);
+      await deps.mailer.send(message);
     },
   };
-}
-
-const b64 = (value: Buffer | string) => Buffer.from(value).toString('base64url');
-
-/** Compact HMAC-SHA256 token: base64url(json).base64url(signature). */
-export function signToken(payload: Record<string, unknown>, secret: string, ttlSeconds: number): string {
-  const body = b64(JSON.stringify({ ...payload, exp: Math.floor(Date.now() / 1000) + ttlSeconds }));
-  return `${body}.${b64(createHmac('sha256', secret).update(body).digest())}`;
-}
-
-export function verifyToken<T extends Record<string, unknown>>(token: string, secret: string): T | null {
-  const [body, signature] = token.split('.');
-  if (!body || !signature) return null;
-  const expected = createHmac('sha256', secret).update(body).digest();
-  const given = Buffer.from(signature, 'base64url');
-  if (given.length !== expected.length || !timingSafeEqual(given, expected)) return null;
-  try {
-    const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as T & { exp: number };
-    return payload.exp * 1000 > Date.now() ? payload : null;
-  } catch {
-    return null;
-  }
-}
-
-/** Fixed-window limiter, per key (IP + route). */
-export function createRateLimiter(limit: number, windowMs: number) {
-  const hits = new Map<string, { count: number; resetAt: number }>();
-  return (key: string): boolean => {
-    const now = Date.now();
-    const entry = hits.get(key);
-    if (!entry || entry.resetAt < now) {
-      hits.set(key, { count: 1, resetAt: now + windowMs });
-      return true;
+  const auth = new AuthService(deps.kv, mailer, { iterations: config.passwordIterations });
+  const libraries = new Map<string, LibraryService>();
+  const libraryFor = (userId: string) => {
+    let library = libraries.get(userId);
+    if (!library) {
+      library = new LibraryService(userId, deps.kv, deps.blobs);
+      libraries.set(userId, library);
     }
-    entry.count++;
-    return entry.count <= limit;
+    return library;
   };
+  const devCode = (email: string) => {
+    if (!config.exposeDevCodes) return {};
+    const mail = lastMail.get(email.trim().toLowerCase());
+    return mail ? { devMail: { to: mail.to, subject: mail.subject, code: mail.code } } : {};
+  };
+  const issue = (session: Session) => ({ token: signToken({ sub: session.userId, typ: 'session' }, config.tokenSecret, SESSION_TTL), session });
+
+  const app = express();
+  app.disable('x-powered-by');
+  app.use(cors({ origin: config.corsOrigins.includes('*') ? '*' : config.corsOrigins }));
+  app.use(express.json({ limit: '100kb' }));
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    next();
+  });
+
+  const limiter = createRateLimiter(30, 60_000);
+  const limited = (req: Request, res: Response, next: NextFunction) => {
+    if (limiter(`${req.ip}:${req.path}`)) return next();
+    res.status(429).json({ error: 'TOO_MANY_REQUESTS', message: 'Too many requests. Wait a minute and try again.' });
+  };
+
+  const requireAuth = (req: AuthedRequest, res: Response, next: NextFunction) => {
+    const header = req.headers.authorization ?? '';
+    const payload = header.startsWith('Bearer ') ? verifyToken<{ sub: string; typ: string }>(header.slice(7), config.tokenSecret) : null;
+    const user = payload?.typ === 'session' ? auth.findUser(payload.sub) : undefined;
+    if (!user) return res.status(401).json({ error: 'UNAUTHORIZED', message: 'Sign in again.' });
+    req.session = { userId: user.id, email: user.email, displayName: user.displayName, issuedAt: Date.now() };
+    next();
+  };
+  const library = (req: AuthedRequest) => libraryFor(req.session!.userId);
+
+  app.get('/api/health', (_req, res) => res.json({ ok: true }));
+
+  // ------------------------------------------------------------- auth
+  app.post('/api/auth/register', limited, async (req, res) => {
+    await auth.register(str(req.body.name), str(req.body.email), str(req.body.password));
+    res.status(201).json({ ok: true, ...devCode(str(req.body.email)) });
+  });
+  app.post('/api/auth/resend', limited, async (req, res) => {
+    await auth.resendVerification(str(req.body.email));
+    res.json({ ok: true, ...devCode(str(req.body.email)) });
+  });
+  app.post('/api/auth/verify', limited, async (req, res) => {
+    res.json(issue(await auth.verifyEmail(str(req.body.email), str(req.body.code))));
+  });
+  app.post('/api/auth/login', limited, async (req, res) => {
+    res.json(issue(await auth.login(str(req.body.email), str(req.body.password))));
+  });
+  app.post('/api/auth/forgot', limited, async (req, res) => {
+    await auth.requestPasswordReset(str(req.body.email));
+    res.json({ ok: true, ...devCode(str(req.body.email)) });
+  });
+  app.post('/api/auth/reset', limited, async (req, res) => {
+    await auth.resetPassword(str(req.body.email), str(req.body.code), str(req.body.password));
+    res.json({ ok: true });
+  });
+  app.get('/api/auth/me', requireAuth, (req: AuthedRequest, res) => res.json({ session: req.session }));
+
+  // ---------------------------------------------------------- library
+  const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: config.maxUploadMb * 1024 * 1024, files: 50 } });
+
+  app.get('/api/library', requireAuth, (req: AuthedRequest, res) => res.json(library(req).toData()));
+  app.get('/api/search', requireAuth, (req: AuthedRequest, res) => res.json({ tracks: library(req).search(str(req.query.q)) }));
+
+  app.post('/api/tracks/upload', requireAuth, upload.array('files'), async (req: AuthedRequest, res) => {
+    const files = ((req.files as Express.Multer.File[] | undefined) ?? []).map(
+      (f) => new File([new Uint8Array(f.buffer)], Buffer.from(f.originalname, 'latin1').toString('utf8'), { type: f.mimetype }),
+    );
+    const result = await library(req).addFiles(files, str(req.body.alsoAddTo) || undefined);
+    res.status(201).json(result);
+  });
+  app.post('/api/tracks/remote', requireAuth, (req: AuthedRequest, res) => {
+    const track = library(req).addRemote(str(req.body.url), { title: str(req.body.title), artist: str(req.body.artist) }, str(req.body.alsoAddTo) || undefined);
+    res.status(201).json({ track });
+  });
+  app.patch('/api/tracks/:id', requireAuth, (req: AuthedRequest, res) => {
+    library(req).setDuration(str(req.params.id), Number(req.body.durationSec));
+    res.json({ ok: true });
+  });
+  app.delete('/api/tracks/:id', requireAuth, async (req: AuthedRequest, res) => {
+    await library(req).deleteTrack(str(req.params.id));
+    res.json({ ok: true });
+  });
+  app.get('/api/tracks/:id/stream-url', requireAuth, (req: AuthedRequest, res) => {
+    const track = library(req).getTrack(str(req.params.id));
+    if (!track) return res.status(404).json({ error: 'NOT_FOUND', message: 'That song no longer exists.' });
+    if (track.source.kind === 'url') return res.json({ url: track.source.url });
+    const sig = signToken({ sub: req.session!.userId, tid: track.id, typ: 'stream' }, config.tokenSecret, STREAM_TTL);
+    res.json({ url: `${config.publicUrl}/api/stream/${track.id}?sig=${sig}` });
+  });
+
+  // Signed URL instead of the session token: <audio> cannot send headers.
+  app.get('/api/stream/:id', (req, res) => {
+    const payload = verifyToken<{ sub: string; tid: string; typ: string }>(str(req.query.sig), config.tokenSecret);
+    if (!payload || payload.typ !== 'stream' || payload.tid !== req.params.id) return res.status(403).end();
+    const track = libraryFor(payload.sub).getTrack(payload.tid);
+    if (!track || track.source.kind !== 'file') return res.status(404).end();
+    res.type(track.source.mimeType || 'audio/mpeg');
+    res.sendFile(deps.blobs.pathFor(track.source.blobKey), { acceptRanges: true, cacheControl: false });
+  });
+
+  app.post('/api/playlists', requireAuth, (req: AuthedRequest, res) => res.status(201).json(library(req).createPlaylist(str(req.body.name)).toData()));
+  app.patch('/api/playlists/:id', requireAuth, (req: AuthedRequest, res) => {
+    library(req).renamePlaylist(str(req.params.id), str(req.body.name));
+    res.json({ ok: true });
+  });
+  app.delete('/api/playlists/:id', requireAuth, (req: AuthedRequest, res) => {
+    library(req).deletePlaylist(str(req.params.id));
+    res.json({ ok: true });
+  });
+  app.post('/api/playlists/:id/tracks', requireAuth, (req: AuthedRequest, res) => {
+    res.json({ added: library(req).addToPlaylist(str(req.params.id), str(req.body.trackId)) });
+  });
+  app.delete('/api/playlists/:id/tracks/:index', requireAuth, async (req: AuthedRequest, res) => {
+    await library(req).removeFromPlaylist(str(req.params.id), int(req.params.index));
+    res.json({ ok: true });
+  });
+  app.post('/api/playlists/:id/move', requireAuth, (req: AuthedRequest, res) => {
+    library(req).moveInPlaylist(str(req.params.id), int(req.body.from), int(req.body.to));
+    res.json({ ok: true });
+  });
+
+  app.use('/api', (_req, res) => res.status(404).json({ error: 'NOT_FOUND', message: 'Unknown endpoint.' }));
+
+  app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    if (error instanceof AuthError) return res.status(STATUS[error.code]).json({ error: error.code, message: error.message });
+    if (error instanceof LibraryError || error instanceof RangeError) return res.status(400).json({ error: 'BAD_REQUEST', message: error.message });
+    if (error instanceof multer.MulterError) {
+      const message = error.code === 'LIMIT_FILE_SIZE' ? `Each file must be under ${config.maxUploadMb} MB.` : error.message;
+      return res.status(413).json({ error: error.code, message });
+    }
+    console.error(error);
+    res.status(500).json({ error: 'INTERNAL', message: 'Something went wrong on the server.' });
+  });
+
+  return app;
 }
